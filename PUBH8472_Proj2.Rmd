@@ -1,0 +1,359 @@
+---
+title: "PUBH8472_Proj2"
+author: "Gretchen Corcoran"
+date: "2025-04-18"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+#read in the data
+gambia_sh <- st_read('/Users/gretchen/Desktop/PUBH8472/gambia_data/shps/sdr_subnational_boundaries.shp')
+
+#probably won't use this
+gambia_geog_covar <- read.csv('/Users/gretchen/Desktop/PUBH8472/gambia_data/GMGC82FL/GMGC82FL.csv')
+
+gambia_data <- read.csv('/Users/gretchen/Desktop/PUBH8472/gambia_data/idhs_00032.csv')
+
+#first I want to combine less severe and more severe physical DV for an overall measure of DV
+gambia_data <- gambia_data %>%
+  mutate(any_dv = as.integer(DVPMSEVER == 1 | DVPLSEVER == 1))
+
+#we have some women in dataset who weren't asked about domestic violence (due to ethics), so drop those - weighting accounts for these
+dv_data <- gambia_data %>%
+  filter(!is.na(any_dv))
+
+#finding overall prevalence of DV rates (expected) - including the weighting variable
+#but first scale the weighting variable
+dv_data$weight_scale <- dv_data$DVWEIGHT/1e6
+
+#weighted dv incidence
+dv_data$weighted_dv_any <- dv_data$any_dv * dv_data$weight_scale
+
+#overall dv rate
+total_dv <- sum(dv_data$weighted_dv_any) / sum(dv_data$weight_scale)
+
+#region level
+region_dv <- aggregate(cbind(weighted_dv_any, weight_scale)~ GEO_GM2013_2019, data = dv_data, sum)
+
+#expected (Ei)
+region_dv$expected <- region_dv$weight_scale*total_dv
+
+#SMR = observed/ expected
+region_dv$smr <- region_dv$weighted_dv_any / region_dv$expected
+
+gambia_sh$GEO_GM2013_2019 <- gambia_sh$REGCODE
+
+region_dv <- merge(region_dv, gambia_sh, by = 'GEO_GM2013_2019', all.y = T)
+
+#now I want to add some covariates that I could look at in the model, but will also need to weight them by region, still using weight_scale
+
+#lets do weights by region, this is easier than summing each time
+weight_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data, sum)
+
+#####CURRWORK - whether woman is currently working
+#recode CURRWORK
+dv_data$currwork <- ifelse(dv_data$CURRWORK == 10, 1,
+                           ifelse(dv_data$CURRWORK == 0, 0, NA))
+
+work_wt <- aggregate(currwork * weight_scale ~ GEO_GM2013_2019, data = dv_data, sum)
+work_region <- merge(work_wt, weight_total, by = "GEO_GM2013_2019")
+work_region$working_percent <- work_region$`currwork * weight_scale`/work_region$weight
+work_region <- work_region[, c("GEO_GM2013_2019", "working_percent")]
+
+#merge with region_dv
+region_dv <- merge(region_dv, work_region, by = 'GEO_GM2013_2019', all.y = T)
+
+
+####WEALTHQ (wealth quantile)
+#center this for later
+dv_data$wealth_centered = dv_data$WEALTHQ - mean(dv_data$WEALTHQ)
+dv_data$wealth_wt <- dv_data$WEALTHQ * dv_data$weight_scale
+wealth_wt <- aggregate(wealth_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+wealth_region <- merge(wealth_wt, weight_total, by = "GEO_GM2013_2019")
+wealth_region$mean_wealth_quantile <- wealth_region$wealth_wt / wealth_region$weight
+wealth_region <- wealth_region[, c("GEO_GM2013_2019", "mean_wealth_quantile")]
+#merge
+region_dv <- merge(region_dv, wealth_region, by = 'GEO_GM2013_2019', all.y = T)
+
+#EDUCLVL (woman's education level)
+dv_data$educ_wt <- dv_data$EDUCLVL * dv_data$weight_scale
+educ_wt <- aggregate(educ_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+educ_region <- merge(educ_wt, weight_total, by = "GEO_GM2013_2019")
+educ_region$mean_educlvl <- educ_region$educ_wt / educ_region$weight
+educ_region <- educ_region[, c("GEO_GM2013_2019", "mean_educlvl")]
+#merge
+region_dv <- merge(region_dv, educ_region, by = 'GEO_GM2013_2019', all.y = T)
+
+
+#####HUSEDLVL
+#note there are some missings/don't knows for this var
+#make sure to filter
+dv_data$HUSEDLVL[dv_data$HUSEDLVL %in% c(7, 9)] <- NA
+#continue on w/o these
+dv_data$hused_wt <- dv_data$HUSEDLVL * dv_data$weight_scale
+hused_num <- aggregate(hused_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = TRUE)
+
+#remove the NAs
+hused_not_NA <- !is.na(dv_data$HUSEDLVL)
+#need different weight_total?
+hused_weight_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[hused_not_NA, ], sum)
+
+hused_region <- merge(hused_num, hused_weight_total, by = "GEO_GM2013_2019")
+hused_region$mean_hused <- hused_region$hused_wt / hused_region$weight_scale
+hused_region <- hused_region[, c("GEO_GM2013_2019", "mean_hused")]
+#merge
+region_dv <- merge(region_dv, hused_region, by = 'GEO_GM2013_2019', all.y = T)
+
+#NEWSFQ is coded 0, 10, 21 - 10 is less than once a week, 21 is once a week or more
+#turning into a weighted binary var (reads newspaper/doesn't read newspaper)
+dv_data$NEWSFQ <- ifelse(dv_data$NEWSFQ == 0, 0,
+                           ifelse(dv_data$NEWSFQ %in% c(10, 21), 1, NA))
+
+dv_data$news_wt <- dv_data$NEWSFQ * dv_data$weight_scale
+news_num <- aggregate(news_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+
+news_region <- merge(news_num, weight_total, by = "GEO_GM2013_2019")
+news_region$news_percent <- news_region$news_wt / news_region$weight_scale
+news_region <- news_region[, c("GEO_GM2013_2019", "news_percent")]
+region_dv <- merge(region_dv, news_region, by = "GEO_GM2013_2019", all.y = T)
+
+#tvfq
+#another weighted binary vary (watches tv/ doesn't watch TV)
+dv_data$TVFQ <- ifelse(dv_data$TVFQ == 0, 0,
+                           ifelse(dv_data$TVFQ %in% c(10, 21), 1, NA))
+
+dv_data$tv_wt <- dv_data$TVFQ * dv_data$weight_scale
+tv_num <- aggregate(tv_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+
+tv_region <- merge(tv_num, weight_total, by = "GEO_GM2013_2019")
+tv_region$tv_percent <- tv_region$tv_wt / tv_region$weight_scale
+tv_region <- tv_region[, c("GEO_GM2013_2019", "tv_percent")]
+region_dv <- merge(region_dv, tv_region, by = "GEO_GM2013_2019", all.y = T)
+
+#radiofq
+#another weighted binary vary (listens to radio / doesn't listen to radio)
+dv_data$RADIOFQ <- ifelse(dv_data$RADIOFQ == 0, 0,
+                           ifelse(dv_data$RADIOFQ %in% c(10, 21), 1, NA))
+
+dv_data$radio_wt <- dv_data$RADIOFQ * dv_data$weight_scale
+radio_num <- aggregate(radio_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+
+radio_region <- merge(radio_num, weight_total, by = "GEO_GM2013_2019")
+radio_region$radio_percent <- radio_region$radio_wt / radio_region$weight_scale
+radio_region <- radio_region[, c("GEO_GM2013_2019", "radio_percent")]
+region_dv <- merge(region_dv, radio_region, by = "GEO_GM2013_2019", all.y = T)
+
+#internetevyr
+#another weighted binary vary (uses computer / doesn't use to computer)
+dv_data$INTERNETEVYR <- ifelse(dv_data$INTERNETEVYR == 0, 0,
+                           ifelse(dv_data$INTERNETEVYR %in% c(11, 12), 1, NA))
+
+dv_data$internet_wt <- dv_data$INTERNETEVYR * dv_data$weight_scale
+internet_num <- aggregate(internet_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+
+internet_region <- merge(internet_num, weight_total, by = "GEO_GM2013_2019")
+internet_region$internet_percent <- internet_region$internet_wt / internet_region$weight_scale
+internet_region <- internet_region[, c("GEO_GM2013_2019", "internet_percent")]
+region_dv <- merge(region_dv, internet_region, by = "GEO_GM2013_2019", all.y = T)
+
+#urban - coded as 1, 2 - fixing urban = 1, rural = 0
+dv_data$URBAN <- ifelse(dv_data$URBAN == 1, 1,
+                           ifelse(dv_data$URBAN == 2, 0, NA))
+
+dv_data$urban_wt <- dv_data$URBAN * dv_data$weight_scale
+urban_num <- aggregate(urban_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+
+urban_region <- merge(urban_num, weight_total, by = "GEO_GM2013_2019")
+urban_region$urban_percent <- urban_region$urban_wt / urban_region$weight_scale
+urban_region <- urban_region[, c("GEO_GM2013_2019", "urban_percent")]
+region_dv <- merge(region_dv, urban_region, by = "GEO_GM2013_2019", all.y = T)
+
+#agefrstmar (age first marriage)
+#99 is NA
+dv_data$agefrstmar <- ifelse(dv_data$AGEFRSTMAR == 99, NA, dv_data$AGEFRSTMAR)
+dv_data$agefrstmar_wt <- dv_data$agefrstmar * dv_data$weight_scale
+
+agefrstmar_num <- aggregate(agefrstmar_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = TRUE)
+agemar_weight_scale <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$agefrstmar), ], sum)
+agemar_region <- merge(agefrstmar_num, agemar_weight_scale, by = "GEO_GM2013_2019")
+
+agemar_region$mean_agefrstmar <- agemar_region$agefrstmar_wt / agemar_region$weight_scale
+agemar_region <- agemar_region[, c("GEO_GM2013_2019", "mean_agefrstmar")]
+
+region_dv <- merge(region_dv, agemar_region, by = "GEO_GM2013_2019", all.y = TRUE)
+
+#decision making variables
+#includes DECFAMVISIT, DECBIGHH, DECFEMEARN, DECHUSEARN, DECFEMHCARE
+#make some sort of composite decision making variable
+#make a function to do this easier instead o fjust redoing it over and over
+dec_maker_func <- function(var) {
+  ifelse(var %in% c(1,2, 10, 20), 1, #she has some say in the decision if answer is 1 or 2 (also sometimes coded 10, 20)
+         ifelse(var %in% c(3, 4, 5, 6, 30, 40, 50, 60, 70), 0, NA)) #9 or 99 is NA, everything else is something else can decide
+}
+
+dv_data$decfamvisit <- dec_maker_func(dv_data$DECFAMVISIT)
+dv_data$dechh <- dec_maker_func(dv_data$DECBIGHH)
+dv_data$fem_earn <- dec_maker_func(dv_data$DECFEMEARN)
+dv_data$hus_earn <- dec_maker_func(dv_data$DECHUSEARN)
+dv_data$health <- dec_maker_func(dv_data$DECFEMHCARE)
+#overall score variable
+dv_data$autonomy_score <- rowMeans(
+  dv_data[, c("decfamvisit", "dechh", "fem_earn", "hus_earn", "health")],
+  na.rm = TRUE #there are NAs, we def need to remove the NAS
+)
+
+dv_data$autonomy_wt <- dv_data$autonomy_score * dv_data$weight_scale
+autonomy_num <- aggregate(autonomy_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = T)
+autonomy_wt_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$autonomy_score), ], sum)
+
+autonomy_region <- merge(autonomy_num, autonomy_wt_total, by = 'GEO_GM2013_2019')
+autonomy_region$mean_autonomy <- autonomy_region$autonomy_wt / autonomy_region$weight_scale
+
+autonomy_region <- autonomy_region[, c("GEO_GM2013_2019", "mean_autonomy")]
+
+region_dv <- merge(region_dv, autonomy_region, by = "GEO_GM2013_2019", all.y = T)
+
+#her age
+dv_data$age_wt <- dv_data$AGE * dv_data$weight_scale
+
+age_num <- aggregate(age_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+
+age_region <- merge(age_num, weight_total, by = "GEO_GM2013_2019")
+age_region$mean_age <- age_region$age_wt / age_region$weight_scale
+age_region <- age_region[, c("GEO_GM2013_2019", "mean_age")]
+
+region_dv <- merge(region_dv, age_region, by = "GEO_GM2013_2019", all.y = T)
+
+#HUSAGE
+#99 is NA here
+dv_data$husage <- ifelse(dv_data$HUSAGE == 99, NA, dv_data$HUSAGE)
+
+dv_data$husage_wt <- dv_data$husage*dv_data$weight_scale
+husage_num <- aggregate(husage_wt ~ GEO_GM2013_2019, data=dv_data, sum, na.rm = T) #we do want to remove NAs here
+#we only want total weight to be calculated on valid husage responses
+husage_weight_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$husage), ], sum)
+
+husage_region <- merge(husage_num, husage_weight_total, by = "GEO_GM2013_2019")
+husage_region$mean_husage <- husage_region$husage_wt / husage_region$weight_scale
+husage_region <- husage_region[, c("GEO_GM2013_2019", "mean_husage")]
+region_dv <- merge(region_dv, husage_region, by = "GEO_GM2013_2019", all.y = T)
+
+
+#code a variable for differences between woman's age and her husband's age
+dv_data$age_gap <- dv_data$husage - dv_data$AGE
+dv_data$age_gap_wt <- dv_data$age_gap * dv_data$weight_scale
+
+age_gap_num <- aggregate(age_gap_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = T) #do want to remove NAs
+age_gap_wt_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$age_gap), ], sum)
+
+agegap_region <- merge(age_gap_num, age_gap_wt_total, by = "GEO_GM2013_2019")
+
+agegap_region$mean_age_gap <- agegap_region$age_gap_wt / agegap_region$weight_scale
+agegap_region <- agegap_region[, c("GEO_GM2013_2019", "mean_age_gap")]
+
+region_dv <- merge(region_dv, agegap_region, by = "GEO_GM2013_2019", all.y = T)
+
+#DVPAHITMA , 7 is don't know, 9 is NA (like not included in model)
+dv_data$dvpahitma <- ifelse(dv_data$DVPAHITMA %in% c(7, 9), NA, dv_data$DVPAHITMA)
+
+dv_data$dvpahitma_wt <- dv_data$dvpahitma*dv_data$weight_scale
+
+dvpahitma_num <- aggregate(dvpahitma_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = T)
+#need different weight_total var
+dvpahitma_wt_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$dvpahitma), ], sum)
+
+dvpahitma_region <- merge(dvpahitma_num, dvpahitma_wt_total, by = "GEO_GM2013_2019")
+
+dvpahitma_region$pct_pahitma <- dvpahitma_region$dvpahitma_wt / dvpahitma_region$weight_scale
+dvpahitma_region <- dvpahitma_region[, c("GEO_GM2013_2019", "pct_pahitma")]
+
+region_dv <- merge(region_dv, dvpahitma_region, by = "GEO_GM2013_2019", all.y = T)
+
+#DV attitudes - making a composite var
+dv_att_maker <- function(var) {
+  ifelse(var %in% c(7, 9), NA, var)
+}
+
+dv_data$dva_usefp <- dv_att_maker(dv_data$DVAUSEFP)
+dv_data$dva_inlaw <- dv_att_maker(dv_data$DVADISINLAW)
+dv_data$dva_kids <- dv_att_maker(dv_data$DVANEGKID)
+dv_data$dva_nosex <- dv_att_maker(dv_data$DVAIFNOSEX)
+dv_data$dva_goout <- dv_att_maker(dv_data$DVAGOOUT)
+dv_data$dva_burnfood <- dv_att_maker(dv_data$DVABURNFOOD)
+dv_data$dva_argue <- dv_att_maker(dv_data$DVAARGUE)
+
+dv_data$dv_approval_score <- rowMeans(
+  dv_data[, c("dva_usefp", "dva_inlaw", "dva_kids", "dva_nosex", "dva_goout", "dva_burnfood", "dva_argue")], na.rm = TRUE #make sure to remove NAs
+)
+
+dv_data$dv_approve_wt <- dv_data$dv_approval_score * dv_data$weight_scale
+
+dv_approve_num <- aggregate(dv_approve_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = T) #could be NA? just in case
+dv_approve_weight_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$dv_approval_score), ], sum)
+
+dv_approve_region <- merge(dv_approve_num, dv_approve_weight_total, by = "GEO_GM2013_2019")
+
+dv_approve_region$mean_dv_approve <- dv_approve_region$dv_approve_wt / dv_approve_region$weight_scale
+dv_approve_region <- dv_approve_region[, c("GEO_GM2013_2019", "mean_dv_approve")]
+
+region_dv <- merge(region_dv, dv_approve_region, by = "GEO_GM2013_2019", all.y = T)
+
+#interaction between CURRWORK & wealthq
+#use currwork binary var already coded
+dv_data$wealth_work_interaction <- dv_data$wealthq_centered*dv_data$currwork
+dv_data$wealth_work_wt    <- dv_data$wealth_work_interaction*dv_data$weight_scale
+interaction_num <- aggregate(wealth_work_wt ~ GEO_GM2013_2019, data = dv_data, sum)
+region_interaction <- merge(interaction_num, total_weight, by = "GEO_GM2013_2019")
+
+region_interaction$mean_wealth_work_int <- region_interaction$wealth_work_wt / region_interaction$weight_scale
+region_interaction <- region_interaction[, c("GEO_GM2013_2019", "mean_wealth_work_int")]
+region_dv <- merge(region_dv, region_interaction, by = "GEO_GM2013_2019", all.y = T)
+
+#interruption during questioning
+#DVINTERRHUS, DVINTERRFEM, DVINTERRMALE
+#binary variable - someone interrupted questioning
+dv_data$inter_fem  <- ifelse(dv_data$DVINTERRFEM == 9, NA, dv_data$DVINTERRFEM)
+dv_data$inter_hus  <- ifelse(dv_data$DVINTERRHUS == 9, NA, dv_data$DVINTERRHUS)
+dv_data$inter_male <- ifelse(dv_data$DVINTERRMALE == 9, NA, dv_data$DVINTERRMALE)
+
+dv_data$dv_interrupt <- ifelse(
+  dv_data$inter_fem %in% c(11, 12) | dv_data$inter_hus %in% c(11,12) | dv_data$inter_male %in% c(11,12), 1,
+  ifelse(dv_data$inter_fem == 0 & dv_data$inter_hus == 0 & dv_data$inter_male == 0, 0, NA)
+)
+
+dv_data$dv_interr_wt <- dv_data$dv_interrupt*dv_data$weight_scale
+
+#there are NAs here, remove
+interrupt_num <- aggregate(dv_interr_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = T)
+inter_wt_total <- aggregate(weight_scale ~ GEO_GM2013_2019,
+                           data = dv_data[!is.na(dv_data$dv_interrupt), ], sum)
+
+interrupt_region <- merge(interrupt_num, inter_wt_total, by = "GEO_GM2013_2019")
+interrupt_region$dv_inter_percent <- interrupt_region$dv_interr_wt / interrupt_region$weight_scale
+interrupt_region <- interrupt_region[, c("GEO_GM2013_2019", "dv_inter_percent")]
+region_dv <- merge(region_dv, interrupt_region, by = "GEO_GM2013_2019", all.y = T)
+
+
+#remember weighted_dv_any is observed
+```
+
+
+```{r}
+#running the model
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
