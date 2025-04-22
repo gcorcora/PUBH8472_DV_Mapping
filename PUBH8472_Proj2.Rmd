@@ -1,25 +1,19 @@
----
-title: "PUBH8472_Proj2"
-author: "Gretchen Corcoran"
-date: "2025-04-18"
-output: pdf_document
----
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
 library(sf)
 library(dplyr)
+library(ggplot2)
+library(viridis)
+library(ggplot2)
+library(haven)
+library(spdep)
+library(nimble)
+library(coda)
+library(patchwork)
+library(knitr)
+library(gt)
+library(writexl)
+library(tibble)
+library(tidyr)
 
-
-```
-
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r}
 #read in the data
 gambia_sh <- st_read('/Users/gretchen/Desktop/PUBH8472/gambia_data/shps/sdr_subnational_boundaries.shp')
 
@@ -37,20 +31,22 @@ dv_data <- gambia_data %>%
   filter(!is.na(any_dv))
 
 #finding overall prevalence of DV rates (expected) - including the weighting variable
-#but first scale the weighting variable
-dv_data$weight_scale <- dv_data$DVWEIGHT/1e6
+#but first scale the weighting variable ##CAREFUL, IPUMSDHS data weighting doesn't need to be divided (unlike senegal)
+dv_data$weight_scale <- dv_data$DVWEIGHT
 
 #weighted dv incidence
-dv_data$weighted_dv_any <- dv_data$any_dv * dv_data$weight_scale
+total_dv <- sum(dv_data$any_dv * dv_data$weight_scale)
+total_pop <- sum(dv_data$weight_scale)
 
 #overall dv rate
-total_dv <- sum(dv_data$weighted_dv_any) / sum(dv_data$weight_scale)
+overall_rate <- total_dv/total_pop
 
 #region level
-region_dv <- aggregate(cbind(weighted_dv_any, weight_scale)~ GEO_GM2013_2019, data = dv_data, sum)
+region_dv <- aggregate(cbind(weighted_dv_any = any_dv*weight_scale, population = weight_scale)~ GEO_GM2013_2019, data = dv_data, sum)
+#weighted_dv_any is observed
 
 #expected (Ei)
-region_dv$expected <- region_dv$weight_scale*total_dv
+region_dv$expected <- region_dv$population*overall_rate
 
 #SMR = observed/ expected
 region_dv$smr <- region_dv$weighted_dv_any / region_dv$expected
@@ -71,7 +67,7 @@ dv_data$currwork <- ifelse(dv_data$CURRWORK == 10, 1,
 
 work_wt <- aggregate(currwork * weight_scale ~ GEO_GM2013_2019, data = dv_data, sum)
 work_region <- merge(work_wt, weight_total, by = "GEO_GM2013_2019")
-work_region$working_percent <- work_region$`currwork * weight_scale`/work_region$weight
+work_region$working_percent <- work_region$`currwork * weight_scale`/work_region$weight_scale
 work_region <- work_region[, c("GEO_GM2013_2019", "working_percent")]
 
 #merge with region_dv
@@ -216,9 +212,13 @@ dv_data$autonomy_score <- rowMeans(
   na.rm = TRUE #there are NAs, we def need to remove the NAS
 )
 
+dv_data$autonomy_score[is.nan(dv_data$autonomy_score)] <- NA
+#now filter for only valid scores
+autonomy_value <- !is.na(dv_data$autonomy_score)
+
 dv_data$autonomy_wt <- dv_data$autonomy_score * dv_data$weight_scale
-autonomy_num <- aggregate(autonomy_wt ~ GEO_GM2013_2019, data = dv_data, sum, na.rm = T)
-autonomy_wt_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[!is.na(dv_data$autonomy_score), ], sum)
+autonomy_num <- aggregate(autonomy_wt ~ GEO_GM2013_2019, data = dv_data[autonomy_value, ], sum, na.rm = T)
+autonomy_wt_total <- aggregate(weight_scale ~ GEO_GM2013_2019, data = dv_data[autonomy_value, ], sum)
 
 autonomy_region <- merge(autonomy_num, autonomy_wt_total, by = 'GEO_GM2013_2019')
 autonomy_region$mean_autonomy <- autonomy_region$autonomy_wt / autonomy_region$weight_scale
@@ -314,10 +314,10 @@ region_dv <- merge(region_dv, dv_approve_region, by = "GEO_GM2013_2019", all.y =
 
 #interaction between CURRWORK & wealthq
 #use currwork binary var already coded
-dv_data$wealth_work_interaction <- dv_data$wealthq_centered*dv_data$currwork
+dv_data$wealth_work_interaction <- dv_data$wealth_centered*dv_data$currwork
 dv_data$wealth_work_wt    <- dv_data$wealth_work_interaction*dv_data$weight_scale
 interaction_num <- aggregate(wealth_work_wt ~ GEO_GM2013_2019, data = dv_data, sum)
-region_interaction <- merge(interaction_num, total_weight, by = "GEO_GM2013_2019")
+region_interaction <- merge(interaction_num, weight_total, by = "GEO_GM2013_2019")
 
 region_interaction$mean_wealth_work_int <- region_interaction$wealth_work_wt / region_interaction$weight_scale
 region_interaction <- region_interaction[, c("GEO_GM2013_2019", "mean_wealth_work_int")]
@@ -349,11 +349,1376 @@ region_dv <- merge(region_dv, interrupt_region, by = "GEO_GM2013_2019", all.y = 
 
 
 #remember weighted_dv_any is observed
-```
 
+##Adding in Senegal 2019 data
+senegal <- read_dta('/Users/gretchen/Desktop/PUBH8472/senegal_data/SNIR8BFL.DTA')
+senegal_sh <- st_read('/Users/gretchen/Desktop/PUBH8472/senegal_data/senegal_boundaries_spa/shps/sdr_subnational_boundaries.shp')
+
+
+#first I want to combine less severe and more severe physical DV for an overall measure of DV
+senegal <- senegal %>%
+  mutate(any_dv = as.integer(d106 == 1 | d107 == 1))
+
+#we have some women in dataset who weren't asked about domestic violence (due to ethics), so drop those - weighting accounts for these
+senegal <- senegal %>%
+  filter(!is.na(any_dv))
+
+#finding overall prevalence of DV rates (expected) - including the weighting variable
+#but first scale the weighting variable ##CAREFUL SENEGAL WEIGHTING DOES NEED TO BE DIVIDED
+senegal$weight_scale <- senegal$d005/1e6
+
+#weighted dv incidence
+total_dv <- sum(senegal$any_dv * senegal$weight_scale)
+total_pop <- sum(senegal$weight_scale)
+
+#overall dv rate
+overall_rate <- total_dv / total_pop
+
+#region level
+#here we use v101 since not on IPUMS DHS yet
+sen_region <- aggregate(cbind(weighted_dv_any = any_dv*weight_scale, population = weight_scale) ~ v101, data = senegal, sum)
+#weighted_dv_any is observed
+
+#expected (Ei)
+sen_region$expected <- sen_region$population*overall_rate
+
+#SMR = observed/ expected
+sen_region$smr <- sen_region$weighted_dv_any / sen_region$expected
+
+#relabel senegal v101 before merging with shape file
+sen_region <- sen_region %>%
+  mutate(v101 = case_when(
+    v101 == 1 ~1,
+    v101 == 2 ~ 14,
+    v101 == 3 ~ 2,
+    v101 == 4 ~ 10,
+    v101 == 5 ~ 12,
+    v101 == 6 ~ 5,
+    v101 == 7 ~ 13,
+    v101 == 8 ~ 8,
+    v101 == 9 ~ 3,
+    v101 == 10 ~ 7,
+    v101 == 11 ~ 9,
+    v101 == 12 ~ 4,
+    v101 == 13 ~ 6,
+    v101 == 14 ~ 11))
+
+#also do this for senegal data
+senegal <- senegal %>%
+  mutate(v101 = case_when(
+    v101 == 1 ~1,
+    v101 == 2 ~ 14,
+    v101 == 3 ~ 2,
+    v101 == 4 ~ 10,
+    v101 == 5 ~ 12,
+    v101 == 6 ~ 5,
+    v101 == 7 ~ 13,
+    v101 == 8 ~ 8,
+    v101 == 9 ~ 3,
+    v101 == 10 ~ 7,
+    v101 == 11 ~ 9,
+    v101 == 12 ~ 4,
+    v101 == 13 ~ 6,
+    v101 == 14 ~ 11))
+
+senegal_sh$v101 <- senegal_sh$REGCODE
+
+sen_region <- merge(sen_region, senegal_sh, by = 'v101', all.y = T)
+
+#now I want to add some covariates that I could look at in the model, but will also need to weight them by region, still using weight_scale
+
+#lets do weights by region, this is easier than summing each time
+weight_total <- aggregate(weight_scale ~ v101, data = senegal, sum)
+
+#####CURRWORK - whether woman is currently working
+#recode CURRWORK
+senegal$currwork <- senegal$v714
+
+work_wt <- aggregate(currwork * weight_scale ~ v101, data = senegal, sum)
+work_region <- merge(work_wt, weight_total, by = "v101")
+work_region$working_percent <- work_region$`currwork * weight_scale`/work_region$weight_scale
+work_region <- work_region[, c("v101", "working_percent")]
+
+#merge with region_dv
+sen_region <- merge(sen_region, work_region, by = 'v101', all.y = T)
+
+
+####WEALTHQ (wealth quantile)
+#center this for later
+senegal$wealth_centered = senegal$v190 - mean(senegal$v190)
+senegal$wealth_wt <- senegal$v190 * senegal$weight_scale
+wealth_wt <- aggregate(wealth_wt ~ v101, data = senegal, sum)
+wealth_region <- merge(wealth_wt, weight_total, by = "v101")
+wealth_region$mean_wealth_quantile <- wealth_region$wealth_wt / wealth_region$weight
+wealth_region <- wealth_region[, c("v101", "mean_wealth_quantile")]
+#merge
+sen_region <- merge(sen_region, wealth_region, by = 'v101', all.y = T)
+
+#EDUCLVL (woman's education level)
+senegal$educ_wt <- senegal$v106 * senegal$weight_scale
+educ_wt <- aggregate(educ_wt ~ v101, data = senegal, sum)
+educ_region <- merge(educ_wt, weight_total, by = "v101")
+educ_region$mean_educlvl <- educ_region$educ_wt / educ_region$weight
+educ_region <- educ_region[, c("v101", "mean_educlvl")]
+#merge
+sen_region <- merge(sen_region, educ_region, by = 'v101', all.y = T)
+
+
+#####HUSEDLVL
+#note there are some missings/don't knows for this var
+#make sure to filter
+senegal$v701[senegal$v701 %in% c(8)] <- NA
+#continue on w/o these
+senegal$hused_wt <- senegal$v701 * senegal$weight_scale
+hused_num <- aggregate(hused_wt ~ v101, data = senegal, sum, na.rm = TRUE)
+
+#remove the NAs
+hused_not_NA <- !is.na(senegal$v701)
+#need different weight_total?
+hused_weight_total <- aggregate(weight_scale ~ v101, data = senegal[hused_not_NA, ], sum)
+
+hused_region <- merge(hused_num, hused_weight_total, by = "v101")
+hused_region$mean_hused <- hused_region$hused_wt / hused_region$weight_scale
+hused_region <- hused_region[, c("v101", "mean_hused")]
+#merge
+sen_region <- merge(sen_region, hused_region, by = 'v101', all.y = T)
+
+#NEWSFQ is coded 0, 1, 2, 3 (less than once/week, at least once/week, almost every day)
+#turning into a weighted binary var (reads newspaper/doesn't read newspaper)
+senegal$v157 <- ifelse(senegal$v157 == 0, 0,
+                           ifelse(senegal$v157 %in% c(1, 2, 3), 1, NA))
+
+senegal$news_wt <- senegal$v157 * senegal$weight_scale
+news_num <- aggregate(news_wt ~ v101, data = senegal, sum)
+
+news_region <- merge(news_num, weight_total, by = "v101")
+news_region$news_percent <- news_region$news_wt / news_region$weight_scale
+news_region <- news_region[, c("v101", "news_percent")]
+sen_region <- merge(sen_region, news_region, by = "v101", all.y = T)
+
+#tvfq - v159
+#need to be another weighted binary vary (watches tv/ doesn't watch TV)
+senegal$v159 <- ifelse(senegal$v159 == 0, 0,
+                           ifelse(senegal$v159 %in% c(1,2,3), 1, NA))
+
+senegal$tv_wt <- senegal$v159 * senegal$weight_scale
+tv_num <- aggregate(tv_wt ~ v101, data = senegal, sum)
+
+tv_region <- merge(tv_num, weight_total, by = "v101")
+tv_region$tv_percent <- tv_region$tv_wt / tv_region$weight_scale
+tv_region <- tv_region[, c("v101", "tv_percent")]
+sen_region <- merge(sen_region, tv_region, by = "v101", all.y = T)
+
+#radiofq v158
+#another weighted binary vary (listens to radio / doesn't listen to radio)
+senegal$v158 <- ifelse(senegal$v158 == 0, 0,
+                           ifelse(senegal$v158 %in% c(1, 2, 3), 1, NA))
+
+senegal$radio_wt <- senegal$v158 * senegal$weight_scale
+radio_num <- aggregate(radio_wt ~ v101, data = senegal, sum)
+
+radio_region <- merge(radio_num, weight_total, by = "v101")
+radio_region$radio_percent <- radio_region$radio_wt / radio_region$weight_scale
+radio_region <- radio_region[, c("v101", "radio_percent")]
+sen_region <- merge(sen_region, radio_region, by = "v101", all.y = T)
+
+#internetevyr
+#another weighted binary vary (uses computer / doesn't use to computer)
+senegal$v171a <- ifelse(senegal$v171a == 0, 0,
+                           ifelse(senegal$v171a %in% c(1, 2, 3), 1, NA))
+
+senegal$internet_wt <- senegal$v171a * senegal$weight_scale
+internet_num <- aggregate(internet_wt ~ v101, data = senegal, sum)
+
+internet_region <- merge(internet_num, weight_total, by = "v101")
+internet_region$internet_percent <- internet_region$internet_wt / internet_region$weight_scale
+internet_region <- internet_region[, c("v101", "internet_percent")]
+sen_region <- merge(sen_region, internet_region, by = "v101", all.y = T)
+
+#urban - coded as 1, 2 - fixing urban = 1, rural = 0
+senegal$v025 <- ifelse(senegal$v025 == 1, 1,
+                           ifelse(senegal$v025 == 2, 0, NA))
+
+senegal$urban_wt <- senegal$v025 * senegal$weight_scale
+urban_num <- aggregate(urban_wt ~ v101, data = senegal, sum)
+
+urban_region <- merge(urban_num, weight_total, by = "v101")
+urban_region$urban_percent <- urban_region$urban_wt / urban_region$weight_scale
+urban_region <- urban_region[, c("v101", "urban_percent")]
+sen_region <- merge(sen_region, urban_region, by = "v101", all.y = T)
+
+#agefrstmar (age first marriage)
+#99 is NA
+senegal$v511 <- ifelse(senegal$v511 == 99, NA, senegal$v511)
+senegal$agefrstmar_wt <- senegal$v511 * senegal$weight_scale
+
+agefrstmar_num <- aggregate(agefrstmar_wt ~ v101, data = senegal, sum, na.rm = TRUE)
+agemar_weight_scale <- aggregate(weight_scale ~ v101, data = senegal[!is.na(senegal$v511), ], sum)
+agemar_region <- merge(agefrstmar_num, agemar_weight_scale, by = "v101")
+
+agemar_region$mean_agefrstmar <- agemar_region$agefrstmar_wt / agemar_region$weight_scale
+agemar_region <- agemar_region[, c("v101", "mean_agefrstmar")]
+
+sen_region <- merge(sen_region, agemar_region, by = "v101", all.y = TRUE)
+
+#decision making variables
+#includes DECFAMVISIT (v743d), DECBIGHH (v743b), DECHUSEARN (v743f), DECFEMHCARE (v743a)
+#make some sort of composite decision making variable
+#make a function to do this easier instead o fjust redoing it over and over
+dec_maker_func <- function(var) {
+  ifelse(var %in% c(1,2), 1, #she has some say in the decision if answer is 1 or 2 (also sometimes coded 10, 20)
+         ifelse(var %in% c(3, 4, 5, 6, 7), 0, NA)) #9 or 99 is NA, everything else is something else can decide
+}
+
+senegal$v743d <- dec_maker_func(senegal$v743d)
+senegal$v743b <- dec_maker_func(senegal$v743b)
+senegal$v743f <- dec_maker_func(senegal$v743f)
+senegal$v743a <- dec_maker_func(senegal$v743a)
+#overall score variable
+senegal$autonomy_score <- rowMeans(
+  senegal[, c("v743d", "v743b", "v743f", "v743a")],
+  na.rm = TRUE #there are NAs, we def need to remove the NAS
+)
+
+#want NaN to be NA
+senegal$autonomy_score[is.nan(senegal$autonomy_score)] <- NA
+#now filter for only valid scores
+autonomy_val <- !is.na(senegal$autonomy_score)
+
+
+senegal$autonomy_wt <- senegal$autonomy_score * senegal$weight_scale
+autonomy_num <- aggregate(autonomy_wt ~ v101, data = senegal[autonomy_val, ], sum, na.rm = T)
+autonomy_wt_total <- aggregate(weight_scale ~ v101, data = senegal[autonomy_val, ], sum)
+
+autonomy_region <- merge(autonomy_num, autonomy_wt_total, by = 'v101')
+autonomy_region$mean_autonomy <- autonomy_region$autonomy_wt / autonomy_region$weight_scale
+
+autonomy_region <- autonomy_region[, c("v101", "mean_autonomy")]
+
+sen_region <- merge(sen_region, autonomy_region, by = "v101", all.y = T)
+
+#her age
+senegal$age_wt <- senegal$v012 * senegal$weight_scale
+
+age_num <- aggregate(age_wt ~ v101, data = senegal, sum)
+
+age_region <- merge(age_num, weight_total, by = "v101")
+age_region$mean_age <- age_region$age_wt / age_region$weight_scale
+age_region <- age_region[, c("v101", "mean_age")]
+
+sen_region <- merge(sen_region, age_region, by = "v101", all.y = T)
+
+#HUSAGE
+#98 is NA here
+senegal$husage <- ifelse(senegal$v730 == 98, NA, senegal$v730)
+
+senegal$husage_wt <- senegal$husage*senegal$weight_scale
+husage_num <- aggregate(husage_wt ~ v101, data=senegal, sum, na.rm = T) #we do want to remove NAs here
+#we only want total weight to be calculated on valid husage responses
+husage_weight_total <- aggregate(weight_scale ~ v101, data = senegal[!is.na(senegal$husage), ], sum)
+
+husage_region <- merge(husage_num, husage_weight_total, by = "v101")
+husage_region$mean_husage <- husage_region$husage_wt / husage_region$weight_scale
+husage_region <- husage_region[, c("v101", "mean_husage")]
+sen_region <- merge(sen_region, husage_region, by = "v101", all.y = T)
+
+
+#code a variable for differences between woman's age and her husband's age
+senegal$age_gap <- senegal$husage - senegal$v012
+senegal$age_gap_wt <- senegal$age_gap * senegal$weight_scale
+
+age_gap_num <- aggregate(age_gap_wt ~ v101, data = senegal, sum, na.rm = T) #do want to remove NAs
+age_gap_wt_total <- aggregate(weight_scale ~ v101, data = senegal[!is.na(senegal$age_gap), ], sum)
+
+agegap_region <- merge(age_gap_num, age_gap_wt_total, by = "v101")
+
+agegap_region$mean_age_gap <- agegap_region$age_gap_wt / agegap_region$weight_scale
+agegap_region <- agegap_region[, c("v101", "mean_age_gap")]
+
+sen_region <- merge(sen_region, agegap_region, by = "v101", all.y = T)
+
+#DVPAHITMA , 7 is don't know, 9 is NA (like not included in model)
+senegal$dvpahitma <- ifelse(senegal$d121 %in% c(8), NA, senegal$d121)
+
+senegal$dvpahitma_wt <- senegal$dvpahitma*senegal$weight_scale
+
+dvpahitma_num <- aggregate(dvpahitma_wt ~ v101, data = senegal, sum, na.rm = T)
+#need different weight_total var
+dvpahitma_wt_total <- aggregate(weight_scale ~ v101, data = senegal[!is.na(senegal$dvpahitma), ], sum)
+
+dvpahitma_region <- merge(dvpahitma_num, dvpahitma_wt_total, by = "v101")
+
+dvpahitma_region$pct_pahitma <- dvpahitma_region$dvpahitma_wt / dvpahitma_region$weight_scale
+dvpahitma_region <- dvpahitma_region[, c("v101", "pct_pahitma")]
+
+sen_region <- merge(sen_region, dvpahitma_region, by = "v101", all.y = T)
+
+#DV attitudes - making a composite var
+dv_att_maker <- function(var) {
+  ifelse(var %in% c(8), NA, var)
+}
+
+senegal$dva_kids <- dv_att_maker(senegal$v744b)
+senegal$dva_nosex <- dv_att_maker(senegal$v744d)
+senegal$dva_goout <- dv_att_maker(senegal$v744a)
+senegal$dva_burnfood <- dv_att_maker(senegal$v744e)
+senegal$dva_argue <- dv_att_maker(senegal$v744c)
+
+senegal$dv_approval_score <- rowMeans(
+  senegal[, c("dva_kids", "dva_nosex", "dva_goout", "dva_burnfood", "dva_argue")], na.rm = TRUE #make sure to remove NAs
+)
+
+senegal$dv_approve_wt <- senegal$dv_approval_score * senegal$weight_scale
+
+dv_approve_num <- aggregate(dv_approve_wt ~ v101, data = senegal, sum, na.rm = T) #could be NA? just in case
+dv_approve_weight_total <- aggregate(weight_scale ~ v101, data = senegal[!is.na(senegal$dv_approval_score), ], sum)
+
+dv_approve_region <- merge(dv_approve_num, dv_approve_weight_total, by = "v101")
+
+dv_approve_region$mean_dv_approve <- dv_approve_region$dv_approve_wt / dv_approve_region$weight_scale
+dv_approve_region <- dv_approve_region[, c("v101", "mean_dv_approve")]
+
+sen_region <- merge(sen_region, dv_approve_region, by = "v101", all.y = T)
+
+#interaction between CURRWORK & wealthq
+#use currwork binary var already coded
+senegal$wealth_work_interaction <- senegal$wealth_centered*senegal$currwork
+senegal$wealth_work_wt    <- senegal$wealth_work_interaction*senegal$weight_scale
+interaction_num <- aggregate(wealth_work_wt ~ v101, data = senegal, sum)
+region_interaction <- merge(interaction_num, weight_total, by = "v101")
+
+region_interaction$mean_wealth_work_int <- region_interaction$wealth_work_wt / region_interaction$weight_scale
+region_interaction <- region_interaction[, c("v101", "mean_wealth_work_int")]
+sen_region <- merge(sen_region, region_interaction, by = "v101", all.y = T)
+
+#interruption during questioning
+#DVINTERRHUS, DVINTERRFEM, DVINTERRMALE
+#binary variable - someone interrupted questioning
+senegal$dv_interrupt <- ifelse(
+  senegal$d122a %in% c(1, 2) | senegal$d122b %in% c(1,2) | senegal$d122c %in% c(1,2), 1,
+  ifelse(senegal$d122a == 0 & senegal$d122b == 0 & senegal$d122c == 0, 0, NA)
+)
+
+senegal$dv_interr_wt <- senegal$dv_interrupt*senegal$weight_scale
+
+#there are NAs here, remove
+interrupt_num <- aggregate(dv_interr_wt ~ v101, data = senegal, sum, na.rm = T)
+inter_wt_total <- aggregate(weight_scale ~ v101,
+                           data = senegal[!is.na(senegal$dv_interrupt), ], sum)
+
+interrupt_region <- merge(interrupt_num, inter_wt_total, by = "v101")
+interrupt_region$dv_inter_percent <- interrupt_region$dv_interr_wt / interrupt_region$weight_scale
+interrupt_region <- interrupt_region[, c("v101", "dv_inter_percent")]
+sen_region <- merge(sen_region, interrupt_region, by = "v101", all.y = T)
+
+#concatenating the two files
+#need to make into sf
+gambia_region_map <- st_as_sf(region_dv)
+gambia_region_map$v101 <- gambia_region_map$GEO_GM2013_2019
+sen_region_map <- st_as_sf(sen_region)
+
+gambia_region_map$country <- "Gambia"
+sen_region_map$country <- "Senegal"
+
+#adding missing columns
+missing_in_sen <- setdiff(names(gambia_region_map), names(sen_region_map))
+sen_region_map[missing_in_sen] <- NA
+missing_in_gambia <- setdiff(names(sen_region_map), names(gambia_region_map))
+gambia_region_map[missing_in_gambia] <- NA
+
+#reordering columns
+sen_region_map <- sen_region_map[, names(gambia_region_map)]
+
+
+dv_combined <- rbind(gambia_region_map, sen_region_map)
+
+#mapping initial SMR (standard morbidity ratio here since no one is dying)
+
+
+ggplot(data = dv_combined) +
+  geom_sf(aes(fill=smr), color = "black") +
+  scale_fill_viridis_c(name = "SMR") +
+  labs(title = "Standardized Morbidity Ratio for Physical Domestic Violence",
+       subtitle = "The Gambia/Senegal 2019 - IPUMS-DHS Weighted Estimates") + #note only physical, not including emotional etc
+  theme_void()
+  
+my_breaks <- c(0, 0.5, 0.95, 1.05, 1.5, 2.5, Inf)
+my_labels <- c("< 0.5", "0.5–0.95", "0.95–1.05", 
+                   "1.05–1.5", "1.5–2.5", "2.5+")
+
+#or do I want to map via quantiles? probably don't want this - but will produce both maps
+dv_combined$smr_quants <- cut(
+  dv_combined$smr,
+  breaks = my_breaks,
+  labels = my_labels,
+  include.lowest = TRUE,
+)
+
+smr_observed_plot_2 <- ggplot(data=dv_combined)+
+  geom_sf(aes(fill = smr_quants), color = "black") +
+  scale_fill_viridis_d(name = "Observed SMR", option = "D",
+                       guide = guide_legend(reverse = T)) +
+  labs(title = "SMR for Physical Domestic Violence",
+       subtitle = "The Gambia/Senegal 2019 - IPUMS DHS Weighted Estimates") +
+  theme_void()
+
+smr_observed_plot_2
+
+ggsave("observed_smr_3.png", plot = smr_observed_plot_2, width = 8, height = 6, dpi = 300)
+
+##Running a Standard Poisson Model##
+#what type of neighbors do we want to use? shared borders? centroids?
+dv_combined <- st_as_sf(dv_combined)
+
+nb <- poly2nb(dv_combined)
+nb_info <- nb2WB(nb)
+
+#had to do this because geometry was being added to X
+dv_df <- st_drop_geometry(dv_combined)
+```
 
 ```{r}
-#running the model
+#WAIC for model with just intercept?
+#nimble Code
+poisson_model <- nimbleCode({
+  #likelihood
+  for(i in 1:N){
+    y[i] ~ dpois(expected[i] * eta[i])
+    #use inner product, much easier to code than each covariate
+    log(eta[i]) <- beta0 + phi[i] + theta[i]
+    
+    #uncorrelated errors - theta
+    theta[i] ~ dnorm(0, tau = tau_H)
+  }
+  #ICAR latent process
+  phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1) #having zero_mean = 1 caused an error, so running without it
+  
+  #priors
+  beta0 ~ dnorm(0, sd=10)
+  
+  #prior for variance based on Gelman (2006)
+  sigma_H ~ dunif(0,100)
+  tau_H <- 1 / sigma_H^2
+  sigma_C ~ dunif(0, 100)
+  tau_C <- 1/sigma_C^2
+  
+  #alpha - how much is spatial? 
+  alpha <- sigma_C/(sigma_H + sigma_C)
+})
+
+constants <- list(
+  N = nrow(dv_combined),
+  adj = nb_info$adj,
+  weights = nb_info$weights,
+  num = nb_info$num,
+  L = length(nb_info$adj),
+  #p = ncol(X),
+  expected = dv_combined$expected) #expected
+
+
+#maybe observed(weighted_dv_any) needs to be rounded - is not integer
+dv_combined$observed <- round(dv_combined$weighted_dv_any)
+
+data <- list(
+  y = dv_combined$observed #observed
+  #X = X
+)
+
+inits_fn <- function() {
+  list(beta0 = 0,
+                 #beta = rep(0, ncol(X)),
+                 theta = rnorm(nrow(dv_combined)),
+                 phi = rnorm(nrow(dv_combined)),
+                 sigma_H = runif(1, 0, 10),
+                 sigma_C = runif(1, 0, 10))}
+
+dv_model <-  nimbleModel(poisson_model,
+                         data = data,
+                         constants = constants)
+
+dv_config <- configureMCMC(dv_model, enableWAIC = TRUE)
+
+dv_config$addMonitors('phi', 'tau_C', 'tau_H', 'alpha', 'eta')
+
+dv_MCMC <- buildMCMC(dv_config)
+dv_compiled <- compileNimble(dv_model, dv_MCMC)
+
+samples <- runMCMC(dv_compiled$dv_MCMC,
+                   inits = inits_fn,
+                   nburnin = 100000,
+                   niter = 500000,
+                   nchains = 3,
+                   samplesAsCodaMCMC = TRUE,
+                   WAIC = TRUE)
+
+summary(samples$samples)
+
+plot(samples$samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha')], density = F)
+
+#WAIC
+waic_int_only = samples$WAIC
+print(waic_int_only)
+
+#sometimes runs, sometimes doesn't
+gelman.diag(samples$samples)
+
+# st_write(dv_combined, "dv_combined.geojson")
+# dv_export <- st_drop_geometry(dv_combined)
+# write.csv(dv_export, "dv_combined.csv")
+
+##Adding first covariate
+
+covariates <- c(
+  "working_percent", "mean_wealth_quantile", "mean_educlvl", "mean_hused",
+  "news_percent", "tv_percent", "radio_percent", "internet_percent",
+  "urban_percent", "mean_agefrstmar", "mean_autonomy", "mean_age",
+  "mean_husage", "mean_age_gap", "pct_pahitma", "mean_dv_approve",
+  "mean_wealth_work_int", "dv_inter_percent"
+)
+
+
+#df for WAIC, pWAIC
+waic_results <- data.frame(
+  covariate = covariates,
+  WAIC = NA_real_,
+  pWAIC = NA_real_
+)
+
+#list to hold summary output
+all_summaries <- list() 
+
+#cycle through each covar
+for (i in seq_along(covariates)) {
+  covariate <- covariates[i]
+  
+  X_temp <- as.matrix(dv_df[, covariate, drop = FALSE])  
+  
+  constants <- list(
+    N = nrow(dv_df),
+    p = 1,
+    adj = nb_info$adj,
+    weights = nb_info$weights,
+    num = nb_info$num,
+    L = length(nb_info$adj),
+    expected = dv_df$expected
+  )
+  
+  data <- list(y = round(dv_df$weighted_dv_any),
+               X = as.numeric(X_temp))
+  
+inits_fn <- function() {
+  list(beta0 = 0,
+                 beta = 0,
+                 theta = rnorm(nrow(dv_combined)),
+                 phi = rnorm(nrow(dv_combined)),
+                 sigma_H = runif(1, 0, 10),
+                 sigma_C = runif(1, 0, 10))}
+
+  
+  model_code <- nimbleCode({
+    for (i in 1:N) {
+      y[i] ~ dpois(expected[i] * eta[i])
+      log(eta[i]) <- beta0 + beta*X[i] + phi[i] + theta[i]
+      theta[i] ~ dnorm(0, tau = tau_H)
+    }
+    phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1)
+    beta0 ~ dnorm(0, sd = 10)
+    beta ~ dnorm(0, sd = 10)
+    sigma_H ~ dunif(0, 100)
+    tau_H <- 1 / sigma_H^2
+    sigma_C ~ dunif(0, 100)
+    tau_C <- 1 / sigma_C^2
+    alpha <- sigma_C / (sigma_C + sigma_H)
+  })
+  
+  model <- nimbleModel(model_code, data = data, constants = constants, inits = inits_fn())
+  config <- configureMCMC(model, enableWAIC = TRUE)
+  
+  config$addMonitors('phi', 'tau_C', 'tau_H', 'alpha', 'eta')
+
+  mcmc <- buildMCMC(config)
+  compiled <- compileNimble(model, mcmc)
+  
+  samples <- runMCMC(compiled$mcmc,
+                     niter = 10000,
+                     nburnin = 5000,
+                     nchains = 3,
+                     WAIC = TRUE,
+                     samplesAsCodaMCMC = TRUE,
+                     inits = inits_fn)
+  
+  waic_results$WAIC[i] <- samples$WAIC$WAIC
+  waic_results$pWAIC[i] <- samples$WAIC$pWAIC
+  
+  all_summaries[[covariate]] <- summary(samples$samples)
+  
+  #printing output
+  cat("finished", covariate, "- wAIC:", samples$WAIC$WAIC, "\n")
+}
+
+#results returned in order
+waic_results_1st_covar <- waic_results[order(waic_results$WAIC), ]
+waic_results_1st_covar
+
+#verify convergence
+
+
+plot(samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha', 'beta0', 'beta[1]')], density = F)
+gelman.diag(samples$samples)
+
+##mean_dv_approve has best WAIC (136), so keep that one. improves over intercept only (138.7982)
+
+##Adding 2nd covariate after dv_mean_approve
+
+covariates <- c(
+  "working_percent", "mean_wealth_quantile", "mean_educlvl", "mean_hused",
+  "news_percent", "tv_percent", "radio_percent", "internet_percent",
+  "urban_percent", "mean_agefrstmar", "mean_autonomy", "mean_age",
+  "mean_husage", "mean_age_gap", "pct_pahitma",
+  "mean_wealth_work_int", "dv_inter_percent"
+)
+
+waic_results <- data.frame(
+  covariate = covariates,
+  WAIC = NA_real_,
+  pWAIC = NA_real_
+)
+
+all_summaries <- list()
+
+for (i in seq_along(covariates)) {
+  covariate <- covariates[i]
+  
+  X_temp <- as.matrix(dv_df[,c('mean_dv_approve', covariate), drop = FALSE])  
+  
+  constants <- list(
+    N = nrow(dv_df),
+    p = ncol(X_temp),
+    adj = nb_info$adj,
+    weights = nb_info$weights,
+    num = nb_info$num,
+    L = length(nb_info$adj),
+    expected = dv_df$expected,
+    X = X_temp
+  )
+  
+  data <- list(y = round(dv_df$weighted_dv_any))
+  
+  inits_fn <- function() list(
+    beta0 = 0,
+    beta = rep(0, ncol(X_temp)),
+    phi = rnorm(constants$N),
+    theta = rnorm(constants$N),
+    sigma_H = runif(1, 0, 10),
+    sigma_C = runif(1, 0, 10)
+  )
+  
+  model_code <- nimbleCode({
+    for (i in 1:N) {
+      y[i] ~ dpois(expected[i] * eta[i])
+    log(eta[i]) <- beta0 + inprod(beta[1:p], X[i, 1:p]) + phi[i] + theta[i]
+    
+    #uncorrelated errors - theta
+    theta[i] ~ dnorm(0, tau = tau_H)
+  }
+  #ICAR latent process
+  phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1) #having zero_mean = 1 caused an error, so running without it
+  
+  #priors
+  beta0 ~ dnorm(0, sd=10)
+  #priors for other betas
+  for(j in 1:p){
+    beta[j] ~ dnorm(0, sd = 10)
+  }
+  
+  #prior for variance based on Gelman (2006)
+  sigma_H ~ dunif(0,100)
+  tau_H <- 1 / sigma_H^2
+  sigma_C ~ dunif(0, 100)
+  tau_C <- 1/sigma_C^2
+  
+  #alpha - how much is spatial? 
+  alpha <- sigma_C/(sigma_H + sigma_C)
+})
+
+  model <- nimbleModel(model_code, data = data, constants = constants, inits = inits_fn())
+  config <- configureMCMC(model, enableWAIC = TRUE)
+  config$addMonitors('phi', 'tau_C', 'tau_H', 'alpha', 'eta')
+
+  mcmc <- buildMCMC(config)
+  compiled <- compileNimble(model, mcmc)
+  
+  samples <- runMCMC(compiled$mcmc,
+                     niter = 10000,
+                     nburnin = 5000,
+                     nchains = 3,
+                     WAIC = TRUE,
+                     samplesAsCodaMCMC = TRUE,
+                     inits = inits_fn)
+  
+  waic_results$WAIC[i] <- samples$WAIC$WAIC
+  waic_results$pWAIC[i] <- samples$WAIC$pWAIC
+  
+  all_summaries[[covariate]] <- summary(samples$samples)
+  
+  cat("Finished", covariate, "- WAIC:", samples$WAIC$WAIC, "\n")
+}
+
+waic_results_2nd_covar <- waic_results[order(waic_results$WAIC), ]
+waic_results_2nd_covar
+
+#verify convergence
+plot(samples$samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha', 'beta0', 'beta[1]', 'beta[2]')], density = F)
+
+gelman.diag(samples$samples)
+
+##mean_dv_approve WAIC was best so must improve on that
+##next best is mean_educlvl, so add to model 
+
+##Adding 3rd covariate after mean_dv_approve and mean_autonomy
+
+covariates <- c(
+  "working_percent", "mean_wealth_quantile", "mean_hused",
+  "news_percent", "tv_percent", "radio_percent", "internet_percent",
+  "urban_percent", "mean_agefrstmar", "mean_autonomy", "mean_age",
+  "mean_husage", "mean_age_gap", "pct_pahitma",
+  "mean_wealth_work_int", "dv_inter_percent"
+)
+
+waic_results <- data.frame(
+  covariate = covariates,
+  WAIC = NA_real_,
+  pWAIC = NA_real_
+)
+
+all_summaries <- list()
+
+for (i in seq_along(covariates)) {
+  covariate <- covariates[i]
+  
+  X_temp <- as.matrix(dv_df[, c('mean_dv_approve', 'mean_educlvl', covariates), drop = FALSE])  
+  
+  constants <- list(
+    N = nrow(dv_df),
+    p = ncol(X_temp),
+    adj = nb_info$adj,
+    weights = nb_info$weights,
+    num = nb_info$num,
+    L = length(nb_info$adj),
+    expected = dv_df$expected,
+    X = X_temp
+  )
+  
+  data <- list(y = round(dv_df$weighted_dv_any))
+  
+inits_fn <- function() {
+  list(beta0 = 0,
+                 beta = rep(0, ncol(X_temp)),
+                 theta = rnorm(nrow(dv_combined)),
+                 phi = rnorm(nrow(dv_combined)),
+                 sigma_H = runif(1, 0, 10),
+                 sigma_C = runif(1, 0, 10))}
+
+  
+  model_code <- nimbleCode({
+    for (i in 1:N) {
+      y[i] ~ dpois(expected[i] * eta[i])
+      log(eta[i]) <- beta0 + inprod(beta[1:p], X[i, 1:p]) + phi[i] + theta[i]
+      theta[i] ~ dnorm(0, tau = tau_H)
+    }
+    phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1)
+    beta0 ~ dnorm(0, sd = 10)
+    beta[1] ~ dnorm(0, sd = 10)
+    sigma_H ~ dunif(0, 100)
+    tau_H <- 1 / sigma_H^2
+    sigma_C ~ dunif(0, 100)
+    tau_C <- 1 / sigma_C^2
+    alpha <- sigma_C / (sigma_C + sigma_H)
+  })
+  
+  model <- nimbleModel(model_code, data = data, constants = constants, inits = inits_fn())
+  config <- configureMCMC(model, enableWAIC = TRUE)
+  config$addMonitors('phi', 'tau_C', 'tau_H', 'alpha', 'eta')
+
+  mcmc <- buildMCMC(config)
+  compiled <- compileNimble(model, mcmc)
+  
+  samples <- runMCMC(compiled$mcmc,
+                     niter = 10000,
+                     nburnin = 5000,
+                     nchains = 3,
+                     WAIC = TRUE,
+                     samplesAsCodaMCMC = TRUE,
+                     inits = inits_fn)
+  
+  waic_results$WAIC[i] <- samples$WAIC$WAIC
+  waic_results$pWAIC[i] <- samples$WAIC$pWAIC
+  
+  all_summaries[[covariate]] <- summary(samples$samples)
+  
+  cat("Finished", covariate, "- WAIC:", samples$WAIC$WAIC, "\n")
+}
+
+waic_results_3rd_covar <- waic_results[order(waic_results$WAIC), ]
+waic_results_3rd_covar
+
+#verify convergence
+plot(samples$samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha', 'beta0', 'beta[1]', 'beta[2]', 'beta[3]')], density = F)
+
+gelman.diag(samples$samples)
+
+##Adding fourth covariate after mean_dv_approve, mean_educ_lvl, mean_autonomy
+
+covariates <- c(
+  "working_percent", "mean_wealth_quantile", "mean_hused",
+  "news_percent", "tv_percent", "radio_percent", "internet_percent",
+  "urban_percent", "mean_agefrstmar", "mean_age",
+  "mean_husage", "mean_age_gap", "pct_pahitma",
+  "mean_wealth_work_int", "dv_inter_percent"
+)
+
+waic_results <- data.frame(
+  covariate = covariates,
+  WAIC = NA_real_,
+  pWAIC = NA_real_
+)
+
+all_summaries <- list()
+
+for (i in seq_along(covariates)) {
+  covariate <- covariates[i]
+  
+  X_temp <- as.matrix(dv_df[, c("mean_dv_approve", "mean_educlvl", "mean_autonomy", covariate), drop = FALSE])
+  
+  constants <- list(
+    N = nrow(dv_df),
+    p = ncol(X_temp),
+    adj = nb_info$adj,
+    weights = nb_info$weights,
+    num = nb_info$num,
+    L = length(nb_info$adj),
+    expected = dv_df$expected,
+    X = X_temp
+  )
+  
+  data <- list(y = round(dv_df$weighted_dv_any))
+  
+  inits_fn <- function() list(
+    beta0 = 0,
+    beta = rep(0, ncol(X_temp)),
+    phi = rnorm(constants$N),
+    theta = rnorm(constants$N),
+    sigma_H = runif(1, 0, 10),
+    sigma_C = runif(1, 0, 10)
+  )
+  
+  model_code <- nimbleCode({
+    for (i in 1:N) {
+      y[i] ~ dpois(expected[i] * eta[i])
+      log(eta[i]) <- beta0 + inprod(beta[1:p], X[i, 1:p]) + phi[i] + theta[i]
+      theta[i] ~ dnorm(0, tau = tau_H)
+    }
+    
+    phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1)
+    
+    beta0 ~ dnorm(0, sd = 10)
+    for(j in 1:p) {
+      beta[j] ~ dnorm(0, sd = 10)
+    }
+    
+    sigma_H ~ dunif(0, 100)
+    tau_H <- 1 / sigma_H^2
+    sigma_C ~ dunif(0, 100)
+    tau_C <- 1 / sigma_C^2
+    
+    alpha <- sigma_C / (sigma_H + sigma_C)
+  })
+  
+  model <- nimbleModel(model_code, data = data, constants = constants, inits = inits_fn())
+  config <- configureMCMC(model, enableWAIC = TRUE)
+  config$addMonitors(c("phi", "tau_C", "tau_H", "alpha", "eta"))
+  mcmc <- buildMCMC(config)
+  compiled <- compileNimble(model, mcmc)
+  
+  samples <- runMCMC(compiled$mcmc,
+                     niter = 10000,
+                     nburnin = 5000,
+                     nchains = 3,
+                     WAIC = TRUE,
+                     samplesAsCodaMCMC = TRUE,
+                     inits = inits_fn)
+
+  waic_results$WAIC[i] <- samples$WAIC$WAIC
+  waic_results$pWAIC[i] <- samples$WAIC$pWAIC
+  
+  all_summaries[[covariate]] <- summary(samples$samples)
+  
+  cat("Finished", covariate, "- WAIC:", samples$WAIC$WAIC, "\n")
+}
+
+waic_results_fourth_covar <- waic_results[order(waic_results$WAIC), ]
+waic_results_fourth_covar
+
+#verify convergence
+plot(samples$samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha', 'beta0', 'beta[1]', 'beta[2]', 'beta[3]', 'beta[4]')], density = F)
+
+##Adding fifth covariate after mean_dv_approve, mean_educ_lvl, mean_autonomy, mean_age_gap
+#next must beat 69
+
+covariates <- c(
+  "working_percent", "mean_wealth_quantile", "mean_hused",
+  "news_percent", "tv_percent", "radio_percent", "internet_percent",
+  "urban_percent", "mean_agefrstmar", "mean_age",
+  "mean_husage", "pct_pahitma",
+  "mean_wealth_work_int", "dv_inter_percent"
+)
+
+waic_results <- data.frame(
+  covariate = covariates,
+  WAIC = NA_real_,
+  pWAIC = NA_real_
+)
+
+all_summaries <- list()
+
+for (i in seq_along(covariates)) {
+  covariate <- covariates[i]
+  
+  X_temp <- as.matrix(dv_df[, c("mean_dv_approve", "mean_educlvl", "mean_autonomy", "mean_age_gap", covariate), drop = FALSE])
+  
+  constants <- list(
+    N = nrow(dv_df),
+    p = ncol(X_temp),
+    adj = nb_info$adj,
+    weights = nb_info$weights,
+    num = nb_info$num,
+    L = length(nb_info$adj),
+    expected = dv_df$expected,
+    X = X_temp
+  )
+  
+  data <- list(y = round(dv_df$weighted_dv_any))
+  
+  inits_fn <- function() list(
+    beta0 = 0,
+    beta = rep(0, ncol(X_temp)),
+    phi = rnorm(constants$N),
+    theta = rnorm(constants$N),
+    sigma_H = runif(1, 0, 10),
+    sigma_C = runif(1, 0, 10)
+  )
+  
+  model_code <- nimbleCode({
+    for (i in 1:N) {
+      y[i] ~ dpois(expected[i] * eta[i])
+      log(eta[i]) <- beta0 + inprod(beta[1:p], X[i, 1:p]) + phi[i] + theta[i]
+      theta[i] ~ dnorm(0, tau = tau_H)
+    }
+    
+    phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1)
+    
+    beta0 ~ dnorm(0, sd = 10)
+    for(j in 1:p) {
+      beta[j] ~ dnorm(0, sd = 10)
+    }
+    
+    sigma_H ~ dunif(0, 100)
+    tau_H <- 1 / sigma_H^2
+    sigma_C ~ dunif(0, 100)
+    tau_C <- 1 / sigma_C^2
+    
+    alpha <- sigma_C / (sigma_H + sigma_C)
+  })
+  
+  model <- nimbleModel(model_code, data = data, constants = constants, inits = inits_fn())
+  config <- configureMCMC(model, enableWAIC = TRUE)
+  config$addMonitors(c("phi", "tau_C", "tau_H", "alpha", "eta"))
+  mcmc <- buildMCMC(config)
+  compiled <- compileNimble(model, mcmc)
+  
+  samples <- runMCMC(compiled$mcmc,
+                     niter = 10000,
+                     nburnin = 5000,
+                     nchains = 3,
+                     WAIC = TRUE,
+                     samplesAsCodaMCMC = TRUE,
+                     inits = inits_fn)
+
+  waic_results$WAIC[i] <- samples$WAIC$WAIC
+  waic_results$pWAIC[i] <- samples$WAIC$pWAIC
+  
+  all_summaries[[covariate]] <- summary(samples$samples)
+  
+  cat("Finished", covariate, "- WAIC:", samples$WAIC$WAIC, "\n")
+}
+
+waic_results_fifth <- waic_results[order(waic_results$WAIC), ]
+waic_results_fifth
+
+#verify convergence
+plot(samples$samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha', 'beta0', 'beta[1]', 'beta[2]', 'beta[3]', 'beta[4]', 'beta[5]')], density = F)
+
+#nothing improved, keep model as is
+
+##Running Final model with mean_dv_approve, mean_autonomy, mean_age_gap, mean_educ_lvl##
+
+#standard poisson model - ingredients
+
+#let's start with simple data matrix then add things in
+X <- as.matrix(dv_df[, c(
+  "mean_dv_approve",
+  "mean_autonomy",
+  "mean_age_gap",
+  "mean_educlvl"
+)])
+
+
+#nimble Code
+poisson_model <- nimbleCode({
+  #likelihood
+  for(i in 1:N){
+    y[i] ~ dpois(expected[i] * eta[i])
+    #use inner product, much easier to code than each covariate
+    log(eta[i]) <- beta0 + inprod(beta[1:p], X[i, 1:p]) + phi[i] + theta[i]
+    
+    #uncorrelated errors - theta
+    theta[i] ~ dnorm(0, tau = tau_H)
+  }
+  #ICAR latent process
+  phi[1:N] ~ dcar_normal(adj[1:L], weights[1:L], num[1:N], tau_C, zero_mean = 1) #having zero_mean = 1 caused an error, so running without it
+  
+  #priors
+  beta0 ~ dnorm(0, sd=10)
+  #priors for other betas
+  for(j in 1:p){
+    beta[j] ~ dnorm(0, sd = 10)
+  }
+  
+  #prior for variance based on Gelman (2006)
+  sigma_H ~ dunif(0,100)
+  tau_H <- 1 / sigma_H^2
+  sigma_C ~ dunif(0, 100)
+  tau_C <- 1/sigma_C^2
+  
+  #alpha - how much is spatial? 
+  alpha <- sigma_C/(sigma_H + sigma_C)
+})
+
+constants <- list(
+  N = nrow(dv_combined),
+  adj = nb_info$adj,
+  weights = nb_info$weights,
+  num = nb_info$num,
+  L = length(nb_info$adj),
+  p = ncol(X),
+  expected = dv_combined$expected) #expected
+
+
+#maybe observed(weighted_dv_any) needs to be rounded - is not integer
+dv_combined$observed <- round(dv_combined$weighted_dv_any)
+
+data <- list(
+  y = dv_combined$observed, #observed
+  X = X
+)
+
+inits_fn <- function() {
+  list(beta0 = 0,
+                 beta = rep(0, ncol(X)),
+                 theta = rnorm(nrow(dv_combined)),
+                 phi = rnorm(nrow(dv_combined)),
+                 sigma_H = runif(1, 0, 10),
+                 sigma_C = runif(1, 0, 10))}
+
+dv_model <-  nimbleModel(poisson_model,
+                         data = data,
+                         constants = constants)
+
+dv_config <- configureMCMC(dv_model)
+
+dv_config$addMonitors('phi', 'tau_C', 'tau_H', 'alpha', 'eta')
+
+dv_MCMC <- buildMCMC(dv_config)
+dv_compiled <- compileNimble(dv_model, dv_MCMC)
+
+samples <- runMCMC(dv_compiled$dv_MCMC,
+                   inits = inits_fn,
+                   nburnin = 100000,
+                   niter = 500000,
+                   nchains = 3,
+                   samplesAsCodaMCMC=TRUE)
+
+summary <- summary(samples)
+
+plot(samples[,c(
+                'sigma_C', 'sigma_H',
+                'alpha', 'beta0')], density = F)
+
+plot(samples[,c('beta[1]', 'beta[2]', 'beta[3]', 'beta[4]')], density=F)
+
+#running gelman.diag on only a subset, beta0, sigma_H, sigma_C, alpha
+main_params <- c("beta0", "sigma_H", "sigma_C", "alpha")
+beta_coeffs <- c("beta[1]", "beta[2]", 'beta[3]', 'beta[4]')
+
+gelman.diag(samples[, main_params])
+gelman.diag(samples[, beta_coeffs])
+
+#grabbing phi and eta params
+phi_names <- grep("^phi\\[", varnames(samples), value = TRUE)
+eta_names <- grep("^eta\\[", varnames(samples), value = TRUE)
+
+#choosing a few phis to view, not all because that lead to an issue (leading minor of order 22)
+phi_subset <- phi_names[round(seq(1, length(phi_names), length.out = 5))]
+
+gelman.diag(samples[, phi_subset])
+gelman.diag(samples[, eta_names])
+
+#overall summary/output report
+params <- c('beta0', 'beta[1]', 'beta[2]', 'beta[3]', 'beta[4]', 'alpha', 'sigma_C', 'sigma_H')
+summary_df <- data.frame(
+  mean = summary$statistics[params, "Mean"],
+  lower_ci = summary$quantiles[params, "2.5%"],
+  upper_ci = summary$quantiles[params, "97.5%"],
+  standard_dev = summary$statistics[params, "SD"])
+
+#exponentiate results (not alpha)
+exp_params <- c('beta0', 'beta[1]', 'beta[2]', 'beta[3]', 'beta[4]')
+
+summary_df$exp_mean = 0
+summary_df$exp_lower = 0
+summary_df$exp_upper = 0
+summary_df$std_dev = 0
+
+summary_df[exp_params, "exp_mean"] <- exp(summary_df[exp_params, "mean"])
+summary_df[exp_params, "exp_lower"] <- exp(summary_df[exp_params, "lower_ci"])
+summary_df[exp_params, "exp_upper"] <- exp(summary_df[exp_params, "upper_ci"])
+summary_df[exp_params, "exp_std_dev"] <- exp(summary_df[exp_params, "std_dev"])
+
+output_labels <- c(
+  "Intercept",
+  "Mean Woman's DV Approval Score",
+  "Mean Woman's Autonomy Score",
+  "Mean Age Gap Between Woman and Husband",
+  "Mean Woman's Education Level",
+  "Spatial Variance Proportion",
+  'Spatial SD',
+  'Heterogeneous SD')
+
+summary_table <- data.frame(
+  Parameter = output_labels,
+  Mean = round(summary_df$mean, 3),
+  'Std. Dev' = round(summary_df$standard_dev, 3),
+  '95% CI' = paste0("[", round(summary_df$lower_ci, 3), ", ", round(summary_df$upper_ci, 3), "]"),
+  check.names = FALSE
+)
+
+summary_table
+
+pretty_table <- summary_table %>%
+  gt() %>%
+  tab_header(
+    title = md("**Bayesian Spatial Poisson Model Results**")
+  ) %>%
+  tab_options(
+    table.font.size = 12,
+    heading.align = "left",
+    column_labels.font.weight = "bold"
+  )
+
+gtsave(pretty_table, "model_results_table.html")
+
+#plotting post-mean-smr
+smr_summary <- summary(samples)$statistics
+
+#getting means for eta
+eta_rows <- grep("^eta\\[", rownames(smr_summary))
+eta_order <- order(as.numeric(gsub("eta\\[|\\]", "", rownames(smr_summary)[eta_rows])))
+dv_combined$post_mean_smr <- smr_summary[eta_rows[eta_order], 1]
+
+my_breaks <- c(0, 0.5, 0.95, 1.05, 1.5, 2.5, Inf)
+my_labels <- c("< 0.5", "0.5–0.95", "0.95–1.05", 
+                   "1.05–1.5", "1.5–2.5", "2.5+")
+
+smr_colors <- viridis(length(my_labels), option = "D")
+names(smr_colors) <- my_labels
+
+dv_combined$smr_cat <- cut(
+  dv_combined$smr,
+  breaks = my_breaks,
+  labels = my_labels,
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+dv_combined$post_smr_cat <- cut(
+  dv_combined$post_mean_smr,
+  breaks = my_breaks,
+  labels = my_labels,
+  include.lowest = TRUE,
+  right = FALSE
+)
+dv_combined$smr_cat <- factor(dv_combined$smr_cat, levels = my_labels)
+dv_combined$post_smr_cat <- factor(dv_combined$post_smr_cat, levels = my_labels)
+
+p1 <- ggplot(dv_combined) +
+  geom_sf(aes(fill = smr_cat), color = "black") +
+  scale_fill_manual(
+    name = "Observed SMR",
+    values = smr_colors,
+    drop = FALSE,
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  labs(title = "Observed SMR") +
+  theme_void()
+
+p2 <- ggplot(dv_combined) +
+  geom_sf(aes(fill = post_smr_cat), color = "black") +
+  scale_fill_manual(
+    name = "Posterior SMR",
+    values = smr_colors,
+    drop = FALSE,
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  labs(title = "Posterior Mean SMR") +
+  theme_void()
+
+smr_comparison = p1 + p2
+
+smr_comparison
+
+ggsave("smr_comparison.png", plot = smr_comparison, width = 8, height = 6, dpi = 300)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+#now plot for only the gambia
+gambia_map <- dv_combined[dv_combined$country == "Gambia", ]
+
+# Factor levels again just to be safe
+gambia_map$smr_cat <- factor(gambia_map$smr_cat, levels = my_labels)
+gambia_map$post_smr_cat <- factor(gambia_map$post_smr_cat, levels = my_labels)
+
+#need to include full color length in plot
+gambia_map$smr_cat <- cut(
+  gambia_map$smr,
+  breaks = my_breaks,
+  labels = my_labels,
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+gambia_map$post_smr_cat <- cut(
+  gambia_map$post_mean_smr,
+  breaks = my_breaks,
+  labels = my_labels,
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+p1 <- ggplot(gambia_map) +
+  geom_sf(aes(fill = smr_cat), color = "black") +
+  scale_fill_manual(
+    name = "Observed SMR",
+    values = smr_colors,
+    drop = FALSE,
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  labs(title = "Observed SMR (Gambia)") +
+  theme_void()
+
+p2 <- ggplot(gambia_map) +
+  geom_sf(aes(fill = post_smr_cat), color = "black") +
+  scale_fill_manual(
+    name = "Posterior SMR",
+    values = smr_colors,
+    drop = FALSE,
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  labs(title = "Posterior Mean SMR (Gambia)") +
+  theme_void()
+
+gambia_smr_comp <- p1 + p2
+
+gambia_smr_comp
+
+ggsave("gambia_smr_comp.png", plot = gambia_smr_comp, width = 8, height = 6, dpi = 300)
+
+
+#covariate table, late addition to report
+covariate_info <- list(
+  working_percent = list(desc = "Proportion of women currently working"),
+  mean_wealth_quantile = list(desc = "Average household wealth quintile (centered)"),
+  mean_educlvl = list(desc = "Mean woman's education level (0 = no education, 1 = primary, 2 = secondary, 3 = higher"),
+  mean_hused = list(desc = "Mean husband's education level 0 = no education, 1 = primary, 2 = secondary, 3= higher"),
+  news_percent = list(desc = "Proportion of women who read newspaper at least once a week"),
+  tv_percent = list(desc = "Proportion of women who watch TV at least once a week"),
+  radio_percent = list(desc = "Proportion of women who listen to radio at least once a week"),
+  internet_percent = list(desc = "Proportion of women who used internet in last year"),
+  urban_percent = list(desc = "Proportion of women in urban areas"),
+  mean_agefrstmar = list(desc = "Mean age at first marriage"),
+  mean_autonomy = list(desc = "Mean autonomy score"),
+  mean_age = list(desc = "Mean age of women"),
+  mean_husage = list(desc = "Mean age of husbands"),
+  mean_age_gap = list(desc = "Mean age gap between woman and her husband"),
+  pct_pahitma = list(desc = "Proportion of DV interviews interrupted"),
+  mean_dv_approve = list(desc = "Mean IPV approval score"),
+  mean_wealth_work_int = list(desc = "Interaction between wealth and working status"),
+  dv_inter_percent = list(desc = "Proportion of women ever experiencing physical IPV")
+)
+
+covariate_table <- tibble::tibble(
+  Variable = names(covariate_info),
+  Description = sapply(covariate_info, function(x) x$desc),
+)
+
+covariate_table
+
+covariate_table <- tibble::tibble(
+  Variable = names(covariate_info),
+  Description = sapply(covariate_info, function(x) x$desc),
+)
+
+kable(covariate_table, caption = "Summary of Regional-Level Covariates")
+
+gt_table <- covariate_table %>%
+  gt() %>%
+  tab_header(title = "Regional-Level Covariates") %>%
+  cols_label(
+    Variable = "Variable Name",
+    Description = "Description"
+  )
+
+gtsave(gt_table, "covariate_description_table.html")
+
+#descriptive statistics
+desc_table <- dv_combined %>%
+  st_drop_geometry() %>%
+  slice(1:8) %>%
+  mutate(
+    Observed_DV_Percent = (weighted_dv_any / population) * 100
+  ) %>%
+  select(
+    Region = REGNAME,
+    Observed_DV_Percent,
+    Autonomy = mean_autonomy,
+    Education_Level = mean_educlvl,
+    DV_Approval = mean_dv_approve,
+    Age_Gap = mean_age_gap
+  ) %>%
+  mutate(across(where(is.numeric), round, digits = 2))
+
+write.csv(desc_table, "gambia_region_summary.csv", row.names = FALSE)
+
+gelman.diag(samples$samples)
