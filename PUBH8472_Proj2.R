@@ -964,7 +964,7 @@ waic_results_1st_covar
 
 plot(samples[,c(
                 'sigma_C', 'sigma_H',
-                'alpha', 'beta0', 'beta[1]')], density = F)
+                'alpha', 'beta0', 'beta')], density = F)
 gelman.diag(samples$samples)
 
 ##mean_dv_approve has best WAIC (136), so keep that one. improves over intercept only (138.7982)
