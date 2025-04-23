@@ -859,10 +859,7 @@ plot(samples$samples[,c(
 
 #WAIC
 waic_int_only = samples$WAIC
-print(waic_int_only)
-
-#sometimes runs, sometimes doesn't
-gelman.diag(samples$samples)
+waic_int_only
 
 # st_write(dv_combined, "dv_combined.geojson")
 # dv_export <- st_drop_geometry(dv_combined)
