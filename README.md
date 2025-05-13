@@ -21,7 +21,8 @@ Gambia Data:
 
 Gambia Shapefiles:
 
-    The 2019 Gambia shapefiles are located in gambia_data/shps - sourced from DHS Spatial Repository. Processing code and instructions are included as part of PUBH8472_Proj2.R
+    The 2019 Gambia shapefiles are located in gambia_data/shps - sourced from DHS Spatial Repository. 
+    Processing code and instructions are included as part of PUBH8472_Proj2.R
     
 Senegal Data:
 
